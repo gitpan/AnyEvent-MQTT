@@ -30,4 +30,4 @@ requires:
 resources:
   bugtracker: http://github.com/beanz/anyevent-mqtt-perl/issues
   repository: git://github.com/beanz/anyevent-mqtt-perl.git
-version: 1.110220
+version: 1.110240

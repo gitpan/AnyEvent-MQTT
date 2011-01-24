@@ -2,7 +2,7 @@ use strict;
 use warnings;
 package AnyEvent::MQTT;
 BEGIN {
-  $AnyEvent::MQTT::VERSION = '1.110220';
+  $AnyEvent::MQTT::VERSION = '1.110240';
 }
 
 # ABSTRACT: AnyEvent module for an MQTT client
@@ -37,6 +37,7 @@ sub new {
            client_id => undef,
            clean_session => 1,
            write_queue => [],
+           inflight => {},
            %p,
           }, $pkg;
 }
@@ -71,16 +72,20 @@ sub publish {
     croak ref $self, '->publish requires "topic" parameter';
   my $qos = exists $p{qos} ? $p{qos} : MQTT_QOS_AT_MOST_ONCE;
   my $cv = exists $p{cv} ? delete $p{cv} : AnyEvent->condvar;
+  my $expect;
+  if ($qos) {
+    $expect = ($qos == MQTT_QOS_AT_LEAST_ONCE ? MQTT_PUBACK : MQTT_PUBREC);
+  }
   my $message = $p{message};
   if (defined $message) {
     print STDERR "publish: message[$message] => $topic\n" if DEBUG;
-    my $mid = $self->{message_id}++;
-    return $self->_send(message_type => MQTT_PUBLISH,
-                        qos => $qos,
-                        topic => $topic,
-                        message_id => $mid,
-                        message => $message,
-                        cv => $cv);
+    $self->_send_with_ack({
+                           message_type => MQTT_PUBLISH,
+                           qos => $qos,
+                           topic => $topic,
+                           message => $message,
+                          }, $cv, $expect);
+    return $cv;
   }
   my $handle = exists $p{handle} ? $p{handle} :
     croak ref $self, '->publish requires "message" or "handle" parameter';
@@ -100,17 +105,52 @@ sub publish {
   my $sub; $sub = sub {
     my ($hdl, $chunk, @args) = @_;
     print STDERR "publish: $chunk => $topic\n" if DEBUG;
-    my $mid = $self->{message_id}++;
-    $self->_send(message_type => MQTT_PUBLISH,
-                 qos => $qos,
-                 topic => $topic,
-                 message_id => $mid,
-                 message => $chunk);
-    $handle->push_read(@push_read_args => $sub);
+    my $send_cv = AnyEvent->condvar;
+    print STDERR "publish: message[$chunk] => $topic\n" if DEBUG;
+    $self->_send_with_ack({
+                           message_type => MQTT_PUBLISH,
+                           qos => $qos,
+                           topic => $topic,
+                           message => $chunk,
+                          }, $send_cv, $expect);
+    $send_cv->cb(sub { $handle->push_read(@push_read_args => $sub ) });
     return;
   };
   $handle->push_read(@push_read_args => $sub);
   return $cv;
+}
+
+sub _send_with_ack {
+  my ($self, $args, $cv, $expect, $dup) = @_;
+  if ($args->{qos}) {
+    unless (exists $args->{message_id}) {
+      $args->{message_id} = $self->{message_id}++;
+    }
+    my $mid = $args->{message_id};
+    my $send_cv = AnyEvent->condvar;
+    $send_cv->cb(sub {
+                   $self->{inflight}->{$mid} =
+                     {
+                      expect => $expect,
+                      message => $args,
+                      cv => $cv,
+                      timeout =>
+                        AnyEvent->timer(after => $self->{keep_alive_timer},
+                                        cb => sub {
+                          print ref $self, " timeout waiting for ",
+                            message_type_string($expect), "\n" if DEBUG;
+                          delete $self->{inflight}->{$mid};
+                          $self->_send_with_ack($args, $cv,
+                                                $expect, 1);
+                        }),
+                     };
+                   });
+    $args->{cv} = $send_cv;
+  } else {
+    $args->{cv} = $cv;
+  }
+  $args->{dup} = 1 if ($dup);
+  return $self->_send(%$args);
 }
 
 
@@ -158,7 +198,7 @@ sub _confirm_subscription {
   my ($self, $mid, $qos) = @_;
   my $topic = delete $self->{_sub_pending_by_message_id}->{$mid};
   unless (defined $topic) {
-    carp "Got SubAck with no pending subscription for message id: $mid\n";
+    carp 'SubAck with no pending subscription for message id: ', $mid, "\n";
     return;
   }
   my $re = topic_to_regexp($topic); # convert MQTT pattern to regexp
@@ -188,12 +228,11 @@ sub _send {
 sub _queue_write {
   my ($self, $msg, $cv) = @_;
   my $queue = $self->{write_queue};
-  print STDERR 'Queuing: ', $msg->string, "\n" if DEBUG;
+  print STDERR 'Queuing: ', ($cv||'no cv'), ' ', $msg->string, "\n" if DEBUG;
   push @{$queue}, [$msg, $cv];
   $self->_write_now unless (defined $self->{_waiting});
   $cv;
 }
-
 
 sub _write_now {
   my $self = shift;
@@ -208,6 +247,7 @@ sub _write_now {
   $self->_reset_keep_alive_timer();
   print STDERR "Sending: ", $msg->string, "\n" if DEBUG;
   $self->{_waiting} = [$msg, $cv];
+  print '  ', (unpack 'H*', $msg->bytes), "\n" if DEBUG;
   $self->{handle}->push_write($msg->bytes);
   $cv;
 }
@@ -304,60 +344,150 @@ sub _reconnect {
 }
 
 sub _handle_message {
-  my ($self, $handle, $msg, $error) = @_;
+  my $self = shift;
+  my ($handle, $msg, $error) = @_;
   return $self->_error(0, $error, 1) if ($error);
-  my $type = $msg->message_type;
-  if ($type == MQTT_CONNACK) {
-    $handle->timeout(undef);
-    print STDERR "Connection ready:\n", $msg->string('  '), "\n" if DEBUG;
-    $self->_write_now();
-    $self->{connected} = 1;
-    $self->{connect_cv}->send(1) if ($self->{connect_cv});
-    delete $self->{connect_cv};
-    $handle->on_drain(sub {
-                        print STDERR "drained\n" if DEBUG;
-                        my $w = $self->{_waiting};
-                        $w->[1]->send(1) if (ref $w && defined $w->[1]);
-                        $self->_write_now;
-                        1;
-                      });
-    return
+  my $method = lc ref $msg;
+  $method =~ s/.*::/_process_/;
+  unless ($self->can($method)) {
+    carp 'Unsupported message ', $msg->string(), "\n";
+    return;
   }
-  if ($type == MQTT_PINGRESP) {
-    return $self->_keep_alive_received();
+  $self->$method(@_);
+}
+
+sub _process_connack {
+  my ($self, $handle, $msg, $error) = @_;
+  $handle->timeout(undef);
+  unless ($msg->return_code == MQTT_CONNECT_ACCEPTED) {
+    return $self->_error(1, 'Connection refused: '.$msg->string, 0);
   }
-  if ($type == MQTT_SUBACK) {
-    print STDERR "Confirmed subscription:\n", $msg->string('  '), "\n" if DEBUG;
-    $self->_confirm_subscription($msg->message_id, $msg->qos_levels->[0]);
-    return
-  }
-  if ($type == MQTT_PUBLISH) {
-    # TODO: handle puback, etc
-    my $msg_topic = $msg->topic;
-    my $msg_data = $msg->message;
-    my $rec = $self->{_sub}->{$msg_topic};
-    my %matched;
-    if ($rec) {
-      foreach my $cb (@{$rec->{cb}}) {
-        next if ($matched{$cb}++);
-        $cb->($msg_topic, $msg_data, $msg);
-      }
+  print STDERR "Connection ready:\n", $msg->string('  '), "\n" if DEBUG;
+  $self->_write_now();
+  $self->{connected} = 1;
+  $self->{connect_cv}->send(1) if ($self->{connect_cv});
+  delete $self->{connect_cv};
+  $handle->on_drain(sub {
+                      print STDERR "drained\n" if DEBUG;
+                      my $w = $self->{_waiting};
+                      $w->[1]->send(1) if (ref $w && defined $w->[1]);
+                      $self->_write_now;
+                      1;
+                    });
+  return
+}
+
+sub _process_pingresp {
+  shift->_keep_alive_received();
+}
+
+sub _process_suback {
+  my ($self, $handle, $msg, $error) = @_;
+  print STDERR "Confirmed subscription:\n", $msg->string('  '), "\n" if DEBUG;
+  $self->_confirm_subscription($msg->message_id, $msg->qos_levels->[0]);
+  return
+}
+
+sub _publish_locally {
+  my ($self, $msg) = @_;
+  my $msg_topic = $msg->topic;
+  my $msg_data = $msg->message;
+  my $rec = $self->{_sub}->{$msg_topic};
+  my %matched;
+  if ($rec) {
+    foreach my $cb (@{$rec->{cb}}) {
+      next if ($matched{$cb}++);
+      $cb->($msg_topic, $msg_data, $msg);
     }
-    foreach my $topic (keys %{$self->{_subre}}) {
-      $rec = $self->{_subre}->{$topic};
-      my $re = $rec->{re};
-      next unless ($msg_topic =~ $re);
-      foreach my $cb (@{$rec->{cb}}) {
-        next if ($matched{$cb}++);
-        $cb->($msg_topic, $msg_data, $msg);
-      }
-    }
-    unless (scalar keys %matched) {
-      carp "Unexpected publish:\n", $msg->string('  '), "\n";
-    }
-    return
   }
-  print STDERR $msg->string(), "\n";
+  foreach my $topic (keys %{$self->{_subre}}) {
+    $rec = $self->{_subre}->{$topic};
+    my $re = $rec->{re};
+    next unless ($msg_topic =~ $re);
+    foreach my $cb (@{$rec->{cb}}) {
+      next if ($matched{$cb}++);
+      $cb->($msg_topic, $msg_data, $msg);
+    }
+  }
+  unless (scalar keys %matched) {
+    carp "Unexpected publish:\n", $msg->string('  '), "\n";
+  }
+  1;
+}
+
+sub _process_publish {
+  my ($self, $handle, $msg, $error) = @_;
+  my $qos = $msg->qos;
+  if ($qos == MQTT_QOS_EXACTLY_ONCE) {
+    my $mid = $msg->message_id;
+    $self->{messages}->{$mid} = $msg;
+    $self->_send(message_type => MQTT_PUBREC, message_id => $mid);
+    return;
+  }
+  $self->_publish_locally($msg);
+  $self->_send(message_type => MQTT_PUBACK, message_id => $msg->message_id)
+    if ($qos == MQTT_QOS_AT_LEAST_ONCE);
+  return
+}
+
+sub _inflight_record {
+  my ($self, $msg) = @_;
+  my $mid = $msg->message_id;
+  unless (exists $self->{inflight}->{$mid}) {
+    carp "Unexpected message for message id $mid\n  ".$msg->string;
+    return;
+  }
+  my $exp_type = $self->{inflight}->{$mid}->{expect};
+  my $got_type = $msg->message_type;
+  unless ($got_type == $exp_type) {
+    carp 'Received ', message_type_string($got_type), ' but expected ',
+      message_type_string($exp_type), " for message id $mid\n";
+    return;
+  }
+  return delete $self->{inflight}->{$mid};
+}
+
+sub _process_puback {
+  my ($self, $handle, $msg, $error) = @_;
+  my $rec = $self->_inflight_record($msg) or return;
+  my $mid = $msg->message_id;
+  print STDERR 'PubAck: ', $mid, ' ', $rec->{cv}, "\n" if DEBUG;
+  $rec->{cv}->send(1);
+  return 1;
+}
+
+sub _process_pubrec {
+  my ($self, $handle, $msg, $error) = @_;
+  my $rec = $self->_inflight_record($msg) or return;
+  my $mid = $msg->message_id;
+  print STDERR 'PubRec: ', $mid, ' ', $rec->{cv}, "\n" if DEBUG;
+  $self->_send_with_ack({
+                           message_type => MQTT_PUBREL,
+                           qos => MQTT_QOS_AT_LEAST_ONCE,
+                           message_id => $mid,
+                          }, $rec->{cv}, MQTT_PUBCOMP);
+}
+
+sub _process_pubrel {
+  my ($self, $handle, $msg, $error) = @_;
+  my $mid = $msg->message_id;
+  print STDERR 'PubRel: ', $mid, "\n" if DEBUG;
+  my $pubmsg = delete $self->{messages}->{$mid};
+  unless ($pubmsg) {
+    carp "Unexpected message for message id $mid\n  ".$msg->string;
+    return;
+  }
+  $self->_publish_locally($pubmsg);
+  $self->_send(message_type => MQTT_PUBCOMP, message_id => $mid);
+}
+
+sub _process_pubcomp {
+  my ($self, $handle, $msg, $error) = @_;
+  my $rec = $self->_inflight_record($msg) or return;
+  my $mid = $msg->message_id;
+  print STDERR 'PubComp: ', $mid, ' ', $rec->{cv}, "\n" if DEBUG;
+  $rec->{cv}->send(1);
+  return 1;
 }
 
 
@@ -387,7 +517,7 @@ AnyEvent::MQTT - AnyEvent module for an MQTT client
 
 =head1 VERSION
 
-version 1.110220
+version 1.110240
 
 =head1 SYNOPSIS
 
