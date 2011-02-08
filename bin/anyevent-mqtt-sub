@@ -6,7 +6,6 @@ use warnings;
 # PODNAME: anyevent-mqtt-sub
 
 
-use strict;
 use Net::MQTT::Constants;
 use AnyEvent::MQTT;
 use Getopt::Long;
@@ -17,6 +16,7 @@ my $man;
 my $verbose = 0;
 my $host = '127.0.0.1';
 my $port = 1883;
+my $retain = 1;
 my $qos = MQTT_QOS_AT_MOST_ONCE;
 my $count;
 my $keep_alive_timer = 120;
@@ -25,6 +25,7 @@ GetOptions('help|?' => \$help,
            'verbose+' => \$verbose,
            'host=s' => \$host,
            'port=i' => \$port,
+           'retain!' => \$retain,
            'qos=i' => \$qos,
            'count=i' => \$count,
            'one|1' => sub { $count = 1 },
@@ -54,6 +55,7 @@ $condvar->recv();
 
 sub output {
   my ($topic, $message, $obj) = @_;
+  return unless ($retain || !$obj->retain); # skip retained messages
   if ($verbose == 0) {
     print $topic, ' ', $message, "\n";
   } else {
@@ -74,7 +76,7 @@ anyevent-mqtt-sub - Perl script for subscribing to an MQTT topic
 
 =head1 VERSION
 
-version 1.110240
+version 1.110390
 
 =head1 SYNOPSIS
 
@@ -137,6 +139,11 @@ is 0 - read forever.
 =item B<-one> or B<-1>
 
 Short for B<-count 1>.  Read one message and exit.
+
+=item B<--no-retain>
+
+Ignore retained messages.  That is, wait for new messages rather than
+processing existing retained messages.
 
 =back
 

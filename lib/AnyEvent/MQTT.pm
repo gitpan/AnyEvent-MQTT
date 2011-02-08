@@ -2,7 +2,7 @@ use strict;
 use warnings;
 package AnyEvent::MQTT;
 BEGIN {
-  $AnyEvent::MQTT::VERSION = '1.110240';
+  $AnyEvent::MQTT::VERSION = '1.110390';
 }
 
 # ABSTRACT: AnyEvent module for an MQTT client
@@ -82,6 +82,7 @@ sub publish {
     $self->_send_with_ack({
                            message_type => MQTT_PUBLISH,
                            qos => $qos,
+                           retain => $p{retain},
                            topic => $topic,
                            message => $message,
                           }, $cv, $expect);
@@ -110,6 +111,7 @@ sub publish {
     $self->_send_with_ack({
                            message_type => MQTT_PUBLISH,
                            qos => $qos,
+                           retain => $p{retain},
                            topic => $topic,
                            message => $chunk,
                           }, $send_cv, $expect);
@@ -517,7 +519,7 @@ AnyEvent::MQTT - AnyEvent module for an MQTT client
 
 =head1 VERSION
 
-version 1.110240
+version 1.110390
 
 =head1 SYNOPSIS
 

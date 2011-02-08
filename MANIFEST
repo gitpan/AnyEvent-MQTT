@@ -6,6 +6,7 @@ META.json
 META.yml
 Makefile.PL
 README
+bin/anyevent-mqtt-monitor
 bin/anyevent-mqtt-pub
 bin/anyevent-mqtt-sub
 debian/changelog
