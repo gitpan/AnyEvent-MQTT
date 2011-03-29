@@ -19,77 +19,49 @@ BEGIN {
     import Test::More skip_all => 'No AnyEvent::Socket module installed: $@';
   }
   import Test::More;
-  use t::Helpers qw/:all/;
+  use t::Helpers qw/test_warn/;
+  use t::MockServer qw/:all/;
 }
 
 my @connections =
   (
    [
-    {
-     desc => q{connect},
-     recv => '10 17
-              00 06 4D 51 49 73 64 70
-              03 02 00 78
-              00 09 61 63 6D 65 5F 6D 71 74 74',
-     send => '20 02 00 00',
-    },
-    {
-     desc => q{subscribe /t1},
-     recv => '82 08 00 01 00 03 2F 74 31 00',
-     send => '90 03 00 01 00',
-    },
-    {
-     desc => q{subscribe /t2},
-     recv => '82 08 00 02 00 03 2F 74 32 00',
-     send => '90 03 00 02 00',
-    },
-    {
-     desc => q{publish /t1 message1},
-     send => '30 0d 00 03 2f 74 31 6d 65 73  73 61 67 65 31',
-    },
-    {
-     desc => q{pingreq trigger next publish},
-     recv => 'C0 00',
-     send => '30 0d 00 03 2f 74 31 6d 65 73  73 61 67 65 32',
-    },
-    {
-     desc => q{publish /t2 message1},
-     send => '30 0d 00 03 2f 74 32 6d 65 73  73 61 67 65 31',
-    },
-    {
-     desc => q{pingreq trigger unsolicited publish},
-     recv => 'C0 00',
-     send => '30 0d 00 03 2f 74 33 6d 65 73  73 61 67 65 31',
-    },
-    {
-     desc => q{publish /t1 message3},
-     send => '30 0d 00 03 2f 74 31 6d 65 73  73 61 67 65 33',
-    },
-    {
-     desc => q{pingreq trigger unsolicited suback},
-     recv => 'C0 00',
-     send => '90 03 00 03 00',
-    },
-    {
-     desc => q{publish /t1 message4},
-     send => '30 0d 00 03 2f 74 31 6d 65 73  73 61 67 65 34',
-    },
-    {
-     desc => q{pingreq trigger ...},
-     recv => 'C0 00',
-    }
+    mockrecv('10 17 00 06  4D 51 49 73   64 70 03 02  00 78 00 09
+              61 63 6D 65  5F 6D 71 74   74', 'connect'),
+    mocksend('20 02 00 00', 'connack'),
+    mockrecv('82 08 00 01  00 03 2F 74   31 00', q{subscribe /t1}),
+    mocksend('90 03 00 01  00', q{suback /t1}),
+    mockrecv('82 08 00 02  00 03 2F 74   32 00', q{subscribe /t2}),
+    mocksend('90 03 00 02  00', q{suback /t2}),
+    mocksend('30 0d 00 03  2f 74 31 6d   65 73 73 61  67 65 31',
+             q{publish /t1 message1}),
+    mockrecv('C0 00', q{pingreq trigger next publish}),
+    mocksend('30 0d 00 03  2f 74 31 6d   65 73 73 61  67 65 32',
+             q{pingreq triggering next publish}),
+    mocksend('30 0d 00 03  2f 74 32 6d   65 73 73 61  67 65 31',
+             q{publish /t2 message1}),
+    mockrecv('C0 00', q{pingreq trigger unsolicited publish}),
+    mocksend('30 0d 00 03  2f 74 33 6d   65 73 73 61  67 65 31',
+             q{pingreq trigger unsolicited publish}),
+    mocksend('30 0d 00 03  2f 74 31 6d   65 73 73 61  67 65 33',
+             q{publish /t1 message3}),
+    mockrecv('C0 00', q{pingreq trigger unsolicited suback}),
+    mocksend('90 03 00 03  00', q{pingreq trigger unsolicited suback}),
+    mocksend('30 0d 00 03  2f 74 31 6d   65 73 73 61  67 65 34',
+             q{publish /t1 message4}),
+    mockrecv('A2 07 00 03  00 03 2F 74   31', q{unsubscribe /t1}),
+    mocksend('B0 02 00 10', q{unsolicited unsuback}),
+    mocksend('B0 02 00 03', q{unsuback /t1}),
    ],
   );
 
-my $cv = AnyEvent->condvar;
-
-eval { test_server($cv, @connections) };
+my $server;
+eval { $server = t::MockServer->new(@connections) };
 plan skip_all => "Failed to create dummy server: $@" if ($@);
 
-my ($host,$port) = @{$cv->recv};
-my $addr = join ':', $host, $port;
+my ($host, $port) = $server->connect_address;
 
-plan tests => 21;
+plan tests => 28;
 
 use_ok('AnyEvent::MQTT');
 
@@ -168,3 +140,21 @@ is($t1_msg, '/t1 message4', '... /t1 message4');
 is($warn,
    q{SubAck with no pending subscription for message id: 3},
    '... unsolicited message warning');
+
+my $unsub_cv = $mqtt->unsubscribe(topic => '/t1');
+ok($unsub_cv, '... unsubscribe /t1');
+my $dup_unsub_cv = AnyEvent->condvar;
+$mqtt->unsubscribe(topic => '/t1',
+                   qos => MQTT_QOS_AT_MOST_ONCE,
+                   cv => $dup_unsub_cv);
+ok($dup_unsub_cv, '... dup unsubscribe /t1');
+my $unsub;
+$warn = test_warn(sub { $unsub = $unsub_cv->recv });
+is($warn,
+   q{UnSubAck with no pending unsubscribe for message id: 16},
+   '... unsolicited unsuback warning');
+ok($unsub, '... unsubcribed /t1');
+ok($dup_unsub_cv->recv, '... dup unsubscribe /t1');
+
+$unsub_cv = $mqtt->unsubscribe(topic => '/t1');
+ok(!$unsub_cv->recv, '... unsub with no sub');

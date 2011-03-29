@@ -2,7 +2,7 @@ NAME
     AnyEvent::MQTT - AnyEvent module for an MQTT client
 
 VERSION
-    version 1.110390
+    version 1.110880
 
 SYNOPSIS
       use AnyEvent::MQTT;
@@ -72,6 +72,9 @@ METHODS
         Sets the client id for the client overriding the default which is
         "Net::MQTT::Message[NNNNN]" where NNNNN is the process id.
 
+    "message_log_callback"
+        Defines a callback to call on every message.
+
   "cleanup()"
     This method attempts to destroy any resources in the event of a
     disconnection or fatal error.
@@ -108,7 +111,7 @@ METHODS
           and subsequently publish, a line at a time.
 
   "subscribe( %parameters )"
-    This method is subscribes to the given topic. The parameter hash may
+    This method subscribes to the given topic. The parameter hash may
     contain values for the following keys:
 
     topic
@@ -116,6 +119,27 @@ METHODS
 
     callback
           for the callback to call with messages (this is required),
+
+    qos
+          QoS level to use (default is MQTT_QOS_AT_MOST_ONCE),
+
+    cv
+          L<AnyEvent> condvar to use to signal the subscription is complete.
+          The received value will be the negotiated QoS level.
+
+    This method returns the value of the cv parameter if it was supplied or
+    an AnyEvent condvar created for this purpose.
+
+  "unsubscribe( %parameters )"
+    This method unsubscribes to the given topic. The parameter hash may
+    contain values for the following keys:
+
+    topic
+          for the topic to subscribe to (this is required),
+
+    callback
+          for the callback to call with messages (this is optional and currently
+          not supported - all callbacks are unsubscribed),
 
     qos
           QoS level to use (default is MQTT_QOS_AT_MOST_ONCE),

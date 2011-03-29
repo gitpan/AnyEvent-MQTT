@@ -19,61 +19,42 @@ BEGIN {
     import Test::More skip_all => 'No AnyEvent::Socket module installed: $@';
   }
   import Test::More;
-  use t::Helpers qw/:all/;
+  use t::MockServer qw/:all/;
 }
 
 my @connections =
   (
    [
-    {
-     desc => q{connect},
-     recv => '10 17
-              00 06 4D 51 49 73 64 70
-              03 02 00 78
-              00 09 61 63 6D 65 5F 6D 71 74 74',
-     send => '20 02 00 00',
-    },
-    {
-     desc => q{subscribe /t/+},
-     recv => '82 09 00 01 00 04 2F 74 2F 2B 00',
-     send => '90 03 00 01 00',
-    },
-    {
-     desc => q{subscribe /t/#},
-     recv => '82 09 00 02 00 04 2F 74 2F 23 00',
-     send => '90 03 00 02 00',
-    },
-    {
-     desc => q{subscribe /t/+/s},
-     recv => '82 0B 00 03 00 06 2F 74 2F 2B 2F 73 00',
-     send => '90 03 00 03 00',
-    },
-    {
-     desc => q{publish /t/a message1},
-     send => '30 0e 00 04 2f 74 2f 61 6d 65 73  73 61 67 65 31',
-    },
-    {
-     desc => q{pingreq trigger publish /t/a/s message2},
-     recv => 'C0 00',
-     send => '30 10 00 06 2f 74 2f 61 2f 73 6d 65 73  73 61 67 65 32',
-    },
+    mockrecv('10 17 00 06  4D 51 49 73   64 70 03 02  00 78 00 09
+              61 63 6D 65  5F 6D 71 74   74', q{connect}),
+    mocksend('20 02 00 00', q{connack}),
+    mockrecv('82 09 00 01  00 04 2F 74   2F 2B 00', q{subscribe /t/+}),
+    mocksend('90 03 00 01  00', q{suback /t/+}),
+    mockrecv('82 09 00 02  00 04 2F 74   2F 23 00', q{subscribe /t/#}),
+    mocksend('90 03 00 02  00', q{suback /t/#}),
+    mockrecv('82 0B 00 03  00 06 2F 74   2F 2B 2F 73  00',
+             q{subscribe /t/+/s}),
+    mocksend('90 03 00 03  00', q{suback /t/+/s}),
+    mocksend('30 0e 00 04  2f 74 2f 61   6d 65 73 73  61 67 65 31',
+             q{publish /t/a message1}),
+    mockrecv('C0 00', q{pingreq trigger publish /t/a/s message2}),
+    mocksend('30 10 00 06  2f 74 2f 61   2f 73 6d 65  73 73 61 67
+              65 32', q{pingreq trigger publish /t/a/s message2}),
    ],
   );
 
-my $cv = AnyEvent->condvar;
-
-eval { test_server($cv, @connections) };
+my $server;
+eval { $server = t::MockServer->new(@connections) };
 plan skip_all => "Failed to create dummy server: $@" if ($@);
 
-my ($host,$port) = @{$cv->recv};
-my $addr = join ':', $host, $port;
+my ($host, $port) = $server->connect_address;
 
 plan tests => 17;
 
 use_ok('AnyEvent::MQTT');
 
 my $mqtt = AnyEvent::MQTT->new(host => $host, port => $port,
-                             client_id => 'acme_mqtt');
+                               client_id => 'acme_mqtt');
 
 ok($mqtt, 'instantiate AnyEvent::MQTT object');
 

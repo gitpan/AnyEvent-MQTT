@@ -19,34 +19,31 @@ BEGIN {
     import Test::More skip_all => 'No AnyEvent::Socket module installed: $@';
   }
   import Test::More;
-  use t::Helpers qw/:all/;
+  use t::MockServer qw/:all/;
 }
 
-my $sent = AnyEvent->condvar;
 my @connections =
   (
    [
-    {
-     desc => q{connect invalid client id},
-     recv => '102600064D514973647003020078
-              0018 616161616161616161616161616161616161616161616161',
-     send => '20020002',
-    },
+    mockrecv('10 26 00 06  4D 51 49 73   64 70 03 02  00 78 00 18
+              61 61 61 61  61 61 61 61   61 61 61 61  61 61 61 61
+              61 61 61 61  61 61 61 61',
+             q{connect invalid client id}),
+    mocksend('20 02 00 02', q{connack invalid client id}),
    ],
   );
 
-my $cv = AnyEvent->condvar;
-
-eval { test_server($cv, @connections) };
+my $server;
+eval { $server = t::MockServer->new(@connections) };
 plan skip_all => "Failed to create dummy server: $@" if ($@);
 
-my ($host,$port) = @{$cv->recv};
-my $addr = join ':', $host, $port;
+my ($host, $port) = $server->connect_address;
 
 plan tests => 5;
 
 use_ok('AnyEvent::MQTT');
 
+my $cv = AnyEvent->condvar;
 my $error = AnyEvent->condvar;
 my $mqtt =
   AnyEvent::MQTT->new(host => $host, port => $port, client_id => 'a' x 24,

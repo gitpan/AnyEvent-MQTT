@@ -41,9 +41,11 @@ my %WriteMakefileArgs = (
     'Net::MQTT::Message' => '0',
     'POSIX' => '0',
     'Pod::Usage' => '0',
+    'Scalar::Util' => '0',
+    'Sub::Name' => '0',
     'constant' => '0'
   },
-  'VERSION' => '1.110390',
+  'VERSION' => '1.110880',
   'test' => {
     'TESTS' => 't/*.t'
   }

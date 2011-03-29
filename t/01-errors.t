@@ -8,6 +8,7 @@ use constant {
 };
 use Net::MQTT::Constants;
 use Errno qw/EPIPE/;
+use Scalar::Util qw/weaken/;
 
 $|=1;
 
@@ -20,40 +21,34 @@ BEGIN {
     import Test::More skip_all => 'No AnyEvent::Socket module installed: $@';
   }
   import Test::More;
-  use t::Helpers qw/:all/;
+  use t::Helpers qw/test_error/;
+  use t::MockServer qw/:all/;
 }
 
 my @connections =
   (
+   [], # just close
    [
-   ],
-   [
-    {
-     desc => q{connect},
-     recv => '10 17
-              00 06 4D 51 49 73 64 70
-              03 02 00 78
-              00 09 61 63 6D 65 5F 6D 71 74 74',
-     sleep => 0.5,
-    },
+    mockrecv('10 17 00 06  4D 51 49 73   64 70 03 02  00 78 00 09
+              61 63 6D 65  5F 6D 71 74   74', 'connect'),
+    mocksleep(0.5, 'connect timeout'),
    ],
   );
 
-my $cv = AnyEvent->condvar;
-
-eval { test_server($cv, @connections) };
+my $server;
+eval { $server = t::MockServer->new(@connections) };
 plan skip_all => "Failed to create dummy server: $@" if ($@);
 
-my ($host,$port) = @{$cv->recv};
-my $addr = join ':', $host, $port;
+my ($host, $port) = $server->connect_address;
 
-plan tests => 12;
+plan tests => 14;
 
 use_ok('AnyEvent::MQTT');
 
+my $cv;
 my $mqtt =
   AnyEvent::MQTT->new(host => $host, port => $port, client_id => 'acme_mqtt',
-                      on_error => sub { $cv->send($!{EPIPE}, @_); });
+                      on_error => sub { $cv->send($!{EPIPE}, @_) });
 
 ok($mqtt, 'instantiate AnyEvent::MQTT object for broken pipe test');
 $cv = $mqtt->connect();
@@ -65,6 +60,10 @@ like($error, qr/^Error: /, '... message');
 is(test_error(sub { $mqtt->subscribe }),
    'AnyEvent::MQTT->subscribe requires "topic" parameter',
    'subscribe w/o topic');
+
+is(test_error(sub { $mqtt->unsubscribe }),
+   'AnyEvent::MQTT->unsubscribe requires "topic" parameter',
+   'unsubscribe w/o topic');
 
 is(test_error(sub { $mqtt->subscribe(topic => '/test') }),
    'AnyEvent::MQTT->subscribe requires "callback" parameter',
@@ -89,3 +88,4 @@ $cv = $mqtt->connect();
 $cv->recv;
 is($error->[0], 0, 'connact timeout - not fatal');
 is($error->[1], 'connack timeout', 'connact timeout - message');
+

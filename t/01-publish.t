@@ -9,6 +9,7 @@ use constant {
 use File::Temp qw/tempfile/;
 use Net::MQTT::Constants;
 use Errno qw/EPIPE/;
+use Scalar::Util qw/weaken/;
 
 $|=1;
 
@@ -21,7 +22,7 @@ BEGIN {
     import Test::More skip_all => 'No AnyEvent::Socket module installed: $@';
   }
   import Test::More;
-  use t::Helpers qw/:all/;
+  use t::MockServer qw/:all/;
 }
 
 my $published;
@@ -29,57 +30,42 @@ my $error;
 my @connections =
   (
    [
-    {
-     desc => q{connect},
-     recv => '10 17
-              00 06 4D 51 49 73 64 70
-              03 02 00 78
-              00 09 61 63 6D 65 5F 6D 71 74 74',
-     send => '20 02 00 00',
-    },
-    {
-     desc => q{publish},
-     recv => '30 0F
-              00 06 2F 74 6F 70 69 63
-              6D 65 73 73 61 67 65',
-     send => sub { $published->send(1) },
-    },
-    {
-     desc => q{publish file handle},
-     recv => '30 10
-              00 06 2F 74 6F 70 69 63
-              6D 65 73 73 61 67 65 32',
-     send => sub { $published->send(2) },
-    },
-    {
-     desc => q{publish AnyEvent::Handle},
-     recv => '30 10
-              00 06 2F 74 6F 70 69 63
-              6D 65 73 73 61 67 65 33',
-     send => sub { $published->send(3) },
-    },
+    mockrecv('10 17 00 06  4D 51 49 73   64 70 03 02  00 78 00 09
+              61 63 6D 65  5F 6D 71 74   74', 'connect'),
+    mocksend('20 02 00 00', 'connack'),
+    mockrecv('30 0F 00 06  2F 74 6F 70   69 63 6D 65  73 73 61 67
+              65', q{publish}),
+    mockcode(sub { $published->send(1) }, q{published}),
+    mockrecv('30 10 00 06  2F 74 6F 70   69 63 6D 65  73 73 61 67
+              65 32', q{publish file handle}),
+    mockcode(sub { $published->send(2) }, q{publish file handle done}),
+    mockrecv('30 10 00 06  2F 74 6F 70   69 63 6D 65  73 73 61 67
+              65 33', q{publish AnyEvent::Handle}),
+    mockcode(sub { $published->send(3) }, q{publish AnyEvent::Handle done}),
    ],
   );
 
-my $cv = AnyEvent->condvar;
-
-eval { test_server($cv, @connections) };
+my $server;
+eval { $server = t::MockServer->new(@connections) };
 plan skip_all => "Failed to create dummy server: $@" if ($@);
 
-my ($host,$port) = @{$cv->recv};
-my $addr = join ':', $host, $port;
+my ($host, $port) = $server->connect_address;
 
-plan tests => 17;
+plan tests => 18;
 
 use_ok('AnyEvent::MQTT');
 
+my @messages;
 my $mqtt = AnyEvent::MQTT->new(host => $host, port => $port,
-                               client_id => 'acme_mqtt');
+                               client_id => 'acme_mqtt',
+                               message_log_callback => sub {
+                                 push @messages, $_[0].' '.$_[1]->string;
+                               });
 
 ok($mqtt, 'instantiate AnyEvent::MQTT object');
 
 $published = AnyEvent->condvar;
-$cv = AnyEvent->condvar;
+my $cv = AnyEvent->condvar;
 $mqtt->publish(message => 'message', topic => '/topic', cv => $cv);
 ok($cv, 'simple message publish');
 is($cv->recv, 1, '... client complete');
@@ -91,6 +77,7 @@ sysseek $fh, 0, 0;
 
 $published = AnyEvent->condvar;
 my $eof = AnyEvent->condvar;
+my $weak_eof = $eof; weaken $weak_eof;
 my $pcv =
   $mqtt->publish(handle => $fh, topic => '/topic',
                  qos => MQTT_QOS_AT_MOST_ONCE,
@@ -98,7 +85,7 @@ my $pcv =
                                     my ($hdl, $fatal, $msg) = @_;
                                     # error on fh close as
                                     # readers are waiting
-                                    $eof->send($!{EPIPE});
+                                    $weak_eof->send($!{EPIPE});
                                     $hdl->destroy;
                                   }]);
 ok($pcv, 'publish file handle');
@@ -112,6 +99,7 @@ sysseek $fh, 0, 0;
 
 $published = AnyEvent->condvar;
 $eof = AnyEvent->condvar;
+$weak_eof = $eof; weaken $weak_eof;
 my $handle;
 $handle = AnyEvent::Handle->new(fh => $fh,
                                 on_error => sub {
@@ -127,3 +115,15 @@ ok($pcv, 'publish AnyEvent::Handle');
 ok($eof->recv, '... expected broken pipe');
 ok($pcv->recv, '... client complete');
 is($published->recv, 3, '... server complete');
+
+is_deeply(\@messages,
+          [
+           '> Connect/at-most-once MQIsdp/3/acme_mqtt ',
+           '< ConnAck/at-most-once Connection Accepted ',
+           "> Publish/at-most-once /topic \n".
+             '  6d 65 73 73 61 67 65                             message',
+           "> Publish/at-most-once /topic \n".
+             '  6d 65 73 73 61 67 65 32                          message2',
+           "> Publish/at-most-once /topic \n".
+             '  6d 65 73 73 61 67 65 33                          message3',
+          ], '... message log');

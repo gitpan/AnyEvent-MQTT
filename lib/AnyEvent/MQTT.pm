@@ -2,7 +2,7 @@ use strict;
 use warnings;
 package AnyEvent::MQTT;
 BEGIN {
-  $AnyEvent::MQTT::VERSION = '1.110390';
+  $AnyEvent::MQTT::VERSION = '1.110880';
 }
 
 # ABSTRACT: AnyEvent module for an MQTT client
@@ -14,6 +14,8 @@ use AnyEvent::Handle;
 use Net::MQTT::Constants;
 use Net::MQTT::Message;
 use Carp qw/croak carp/;
+use Sub::Name;
+use Scalar::Util qw/weaken/;
 
 
 sub new {
@@ -50,6 +52,7 @@ sub DESTROY {
 sub cleanup {
   my $self = shift;
   print STDERR "cleanup\n" if DEBUG;
+  $self->{handle}->destroy if ($self->{handle});
   delete $self->{handle};
   delete $self->{connected};
   delete $self->{wait};
@@ -96,26 +99,31 @@ sub publish {
     $handle = AnyEvent::Handle->new(fh => $handle, @args);
   }
   my $error_sub = $handle->{on_error}; # Hack: There is no accessor api
-  $handle->on_error(sub {
+  $handle->on_error(subname 'on_error_for_read_publish_'.$topic =>
+                    sub {
+                      my ($hdl, $fatal, $msg) = @_;
                       $error_sub->(@_) if ($error_sub);
-                      $handle->destroy;
-                      undef $handle;
+                      $hdl->destroy;
+                      undef $hdl;
                       $cv->send(1);
                     });
+  my $weak_self = $self;
+  weaken $weak_self;
   my @push_read_args = @{$p{push_read_args}||['line']};
-  my $sub; $sub = sub {
+  my $sub; $sub = subname 'push_read_cb_for_'.$topic => sub {
     my ($hdl, $chunk, @args) = @_;
     print STDERR "publish: $chunk => $topic\n" if DEBUG;
     my $send_cv = AnyEvent->condvar;
     print STDERR "publish: message[$chunk] => $topic\n" if DEBUG;
-    $self->_send_with_ack({
+    $weak_self->_send_with_ack({
                            message_type => MQTT_PUBLISH,
                            qos => $qos,
                            retain => $p{retain},
                            topic => $topic,
                            message => $chunk,
                           }, $send_cv, $expect);
-    $send_cv->cb(sub { $handle->push_read(@push_read_args => $sub ) });
+    $send_cv->cb(subname 'publish_ack_'.$topic =>
+                 sub { $handle->push_read(@push_read_args => $sub ) });
     return;
   };
   $handle->push_read(@push_read_args => $sub);
@@ -130,7 +138,7 @@ sub _send_with_ack {
     }
     my $mid = $args->{message_id};
     my $send_cv = AnyEvent->condvar;
-    $send_cv->cb(sub {
+    $send_cv->cb(subname 'ack_cb_for_'.$mid => sub {
                    $self->{inflight}->{$mid} =
                      {
                       expect => $expect,
@@ -138,7 +146,8 @@ sub _send_with_ack {
                       cv => $cv,
                       timeout =>
                         AnyEvent->timer(after => $self->{keep_alive_timer},
-                                        cb => sub {
+                                        cb => subname 'ack_timeout_for_'.$mid =>
+                                        sub {
                           print ref $self, " timeout waiting for ",
                             message_type_string($expect), "\n" if DEBUG;
                           delete $self->{inflight}->{$mid};
@@ -164,7 +173,7 @@ sub subscribe {
     croak ref $self, '->subscribe requires "callback" parameter';
   my $qos = exists $p{qos} ? $p{qos} : MQTT_QOS_AT_MOST_ONCE;
   my $cv = exists $p{cv} ? delete $p{cv} : AnyEvent->condvar;
-  my $mid = $self->_add_subscription($topic, $sub, $cv);
+  my $mid = $self->_add_subscription($topic, $cv, $sub);
   if (defined $mid) { # not already subscribed/subscribing
     $self->_send(message_type => MQTT_SUBSCRIBE,
                  message_id => $mid,
@@ -173,8 +182,24 @@ sub subscribe {
   $cv
 }
 
+
+sub unsubscribe {
+  my ($self, %p) = @_;
+  my $topic = exists $p{topic} ? $p{topic} :
+    croak ref $self, '->unsubscribe requires "topic" parameter';
+  my $qos = exists $p{qos} ? $p{qos} : MQTT_QOS_AT_MOST_ONCE;
+  my $cv = exists $p{cv} ? delete $p{cv} : AnyEvent->condvar;
+  my $mid = $self->_remove_subscription($topic, $cv);
+  if (defined $mid) { # not already subscribed/subscribing
+    $self->_send(message_type => MQTT_UNSUBSCRIBE,
+                 message_id => $mid,
+                 topics => [$topic]);
+  }
+  $cv
+}
+
 sub _add_subscription {
-  my ($self, $topic, $sub, $cv) = @_;
+  my ($self, $topic, $cv, $sub) = @_;
   my $rec = $self->{_sub}->{$topic};
   if ($rec) {
     print STDERR "Add $sub to existing $topic subscription\n" if DEBUG;
@@ -196,6 +221,28 @@ sub _add_subscription {
   $mid;
 }
 
+sub _remove_subscription {
+  my ($self, $topic, $cv, $sub) = @_;
+  my $rec = $self->{_unsub_pending}->{$topic};
+  if ($rec) {
+    print STDERR "Remove of $topic with pending unsubscribe\n" if DEBUG;
+    push @{$rec->{cv}}, $cv;
+    return;
+  }
+  $rec = $self->{_sub}->{$topic};
+  if ($rec) {
+    print STDERR "Remove of $topic\n" if DEBUG;
+    my $mid = $self->{message_id}++;
+    delete $self->{_sub}->{$topic};
+    $self->{_unsub_pending_by_message_id}->{$mid} = $topic;
+    $self->{_unsub_pending}->{$topic} = { cv => [ $cv ] };
+    return $mid;
+  }
+  print STDERR "Remove of $topic with no subscription\n" if DEBUG;
+  $cv->send(0);
+  return;
+}
+
 sub _confirm_subscription {
   my ($self, $mid, $qos) = @_;
   my $topic = delete $self->{_sub_pending_by_message_id}->{$mid};
@@ -215,6 +262,19 @@ sub _confirm_subscription {
 
   foreach my $cv (@{$rec->{cv}}) {
     $cv->send($qos);
+  }
+}
+
+sub _confirm_unsubscribe {
+  my ($self, $mid) = @_;
+  my $topic = delete $self->{_unsub_pending_by_message_id}->{$mid};
+  unless (defined $topic) {
+    carp 'UnSubAck with no pending unsubscribe for message id: ', $mid, "\n";
+    return;
+  }
+  my $rec = delete $self->{_unsub_pending}->{$topic};
+  foreach my $cv (@{$rec->{cv}}) {
+    $cv->send(1);
   }
 }
 
@@ -248,6 +308,7 @@ sub _write_now {
   }
   $self->_reset_keep_alive_timer();
   print STDERR "Sending: ", $msg->string, "\n" if DEBUG;
+  $self->{message_log_callback}->('>', $msg) if ($self->{message_log_callback});
   $self->{_waiting} = [$msg, $cv];
   print '  ', (unpack 'H*', $msg->bytes), "\n" if DEBUG;
   $self->{handle}->push_write($msg->bytes);
@@ -259,9 +320,12 @@ sub _reset_keep_alive_timer {
   undef $self->{_keep_alive_handle};
   my $method = $wait ? '_keep_alive_timeout' : '_send_keep_alive';
   $self->{_keep_alive_waiting} = $wait;
+  my $weak_self = $self;
+  weaken $weak_self;
   $self->{_keep_alive_handle} =
     AnyEvent->timer(after => $self->{keep_alive_timer},
-                    cb => sub { $self->$method(@_) });
+                    cb => subname((substr $method, 1).'_cb' =>
+                                  sub { $weak_self->$method(@_) }));
 }
 
 sub _send_keep_alive {
@@ -299,42 +363,48 @@ sub connect {
     $cv = $self->{connect_cv};
   }
   return $cv if ($self->{handle});
+
+  my $weak_self = $self;
+  weaken $weak_self;
+
   my $hd;
   $hd = $self->{handle} =
     AnyEvent::Handle->new(connect => [$self->{host}, $self->{port}],
-                          on_error => sub {
+                          on_error => subname('on_error_cb' => sub {
                             my ($handle, $fatal, $message) = @_;
                             print STDERR "handle error $_[1]\n" if DEBUG;
                             $handle->destroy;
-                            $self->_error($fatal, 'Error: '.$message, 0);
-                          },
+                            $weak_self->_error($fatal, 'Error: '.$message, 0);
+                          }),
                           # on_eof => ... no eof as there is no QUIT so
                           # there is always a waiting reader
-                          on_timeout => sub {
-                            $self->_error(0, $self->{wait}.' timeout', 1);
-                            $self->{wait} = 'nothing';
-                          },
-                          on_connect => sub {
+                          on_timeout => subname('on_timeout_cb' => sub {
+                            $weak_self->_error(0, $weak_self->{wait}.' timeout', 1);
+                            $weak_self->{wait} = 'nothing';
+                          }),
+                          on_connect => subname('on_connect_cb' => sub {
+                            my ($handle, $host, $port, $retry) = @_;
                             print STDERR "TCP handshake complete\n" if DEBUG;
                             my $msg =
                               Net::MQTT::Message->new(
                                 message_type => MQTT_CONNECT,
-                                keep_alive_timer => $self->{keep_alive_timer},
-                                client_id => $self->{client_id},
-                                clean_session => $self->{clean_session},
-                                will_topic => $self->{will_topic},
-                                will_qos => $self->{will_qos},
-                                will_retain => $self->{will_retain},
-                                will_message => $self->{will_message},
+                                keep_alive_timer => $weak_self->{keep_alive_timer},
+                                client_id => $weak_self->{client_id},
+                                clean_session => $weak_self->{clean_session},
+                                will_topic => $weak_self->{will_topic},
+                                will_qos => $weak_self->{will_qos},
+                                will_retain => $weak_self->{will_retain},
+                                will_message => $weak_self->{will_message},
                               );
-                            $self->_write_now($msg);
-                            $hd->timeout($self->{timeout});
-                            $self->{wait} = 'connack';
-                            $hd->push_read(ref $self => sub {
-                                             $self->_handle_message(@_);
+                            $weak_self->_write_now($msg);
+                            $handle->timeout($weak_self->{timeout});
+                            $weak_self->{wait} = 'connack';
+                            $handle->push_read(ref $weak_self =>
+                                           subname 'reader_cb' => sub {
+                                             $weak_self->_handle_message(@_);
                                              return;
                                            });
-                          });
+                          }));
   return $cv
 }
 
@@ -349,6 +419,7 @@ sub _handle_message {
   my $self = shift;
   my ($handle, $msg, $error) = @_;
   return $self->_error(0, $error, 1) if ($error);
+  $self->{message_log_callback}->('<', $msg) if ($self->{message_log_callback});
   my $method = lc ref $msg;
   $method =~ s/.*::/_process_/;
   unless ($self->can($method)) {
@@ -369,11 +440,15 @@ sub _process_connack {
   $self->{connected} = 1;
   $self->{connect_cv}->send(1) if ($self->{connect_cv});
   delete $self->{connect_cv};
-  $handle->on_drain(sub {
+
+  my $weak_self = $self;
+  weaken $weak_self;
+
+  $handle->on_drain(subname 'on_drain_cb' => sub {
                       print STDERR "drained\n" if DEBUG;
-                      my $w = $self->{_waiting};
+                      my $w = $weak_self->{_waiting};
                       $w->[1]->send(1) if (ref $w && defined $w->[1]);
-                      $self->_write_now;
+                      $weak_self->_write_now;
                       1;
                     });
   return
@@ -387,6 +462,13 @@ sub _process_suback {
   my ($self, $handle, $msg, $error) = @_;
   print STDERR "Confirmed subscription:\n", $msg->string('  '), "\n" if DEBUG;
   $self->_confirm_subscription($msg->message_id, $msg->qos_levels->[0]);
+  return
+}
+
+sub _process_unsuback {
+  my ($self, $handle, $msg, $error) = @_;
+  print STDERR "Confirmed unsubscribe:\n", $msg->string('  '), "\n" if DEBUG;
+  $self->_confirm_unsubscribe($msg->message_id);
   return
 }
 
@@ -495,8 +577,10 @@ sub _process_pubcomp {
 
 sub anyevent_read_type {
   my ($handle, $cb) = @_;
-  sub {
+  subname 'anyevent_read_type_reader' => sub {
+    my ($handle) = @_;
     my $rbuf = \$handle->{rbuf};
+    weaken $rbuf;
     return unless (defined $$rbuf);
     while (1) {
       my $msg = Net::MQTT::Message->new_from_bytes($$rbuf, 1);
@@ -519,7 +603,7 @@ AnyEvent::MQTT - AnyEvent module for an MQTT client
 
 =head1 VERSION
 
-version 1.110390
+version 1.110880
 
 =head1 SYNOPSIS
 
@@ -606,6 +690,10 @@ it is set to 0 when reconnecting after an error.
 Sets the client id for the client overriding the default which
 is C<Net::MQTT::Message[NNNNN]> where NNNNN is the process id.
 
+=item C<message_log_callback>
+
+Defines a callback to call on every message.
+
 =back
 
 =head2 C<cleanup()>
@@ -660,7 +748,7 @@ The parameter hash may also keys for:
 
 =head2 C<subscribe( %parameters )>
 
-This method is subscribes to the given topic.  The parameter hash
+This method subscribes to the given topic.  The parameter hash
 may contain values for the following keys:
 
 =over
@@ -672,6 +760,36 @@ may contain values for the following keys:
 =item B<callback>
 
   for the callback to call with messages (this is required),
+
+=item B<qos>
+
+  QoS level to use (default is MQTT_QOS_AT_MOST_ONCE),
+
+=item B<cv>
+
+  L<AnyEvent> condvar to use to signal the subscription is complete.
+  The received value will be the negotiated QoS level.
+
+=back
+
+This method returns the value of the B<cv> parameter if it was
+supplied or an L<AnyEvent> condvar created for this purpose.
+
+=head2 C<unsubscribe( %parameters )>
+
+This method unsubscribes to the given topic.  The parameter hash
+may contain values for the following keys:
+
+=over
+
+=item B<topic>
+
+  for the topic to subscribe to (this is required),
+
+=item B<callback>
+
+  for the callback to call with messages (this is optional and currently
+  not supported - all callbacks are unsubscribed),
 
 =item B<qos>
 
