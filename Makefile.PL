@@ -25,8 +25,8 @@ my %WriteMakefileArgs = (
   'DISTNAME' => 'AnyEvent-MQTT',
   'EXE_FILES' => [
     'bin/anyevent-mqtt-monitor',
-    'bin/anyevent-mqtt-sub',
-    'bin/anyevent-mqtt-pub'
+    'bin/anyevent-mqtt-pub',
+    'bin/anyevent-mqtt-sub'
   ],
   'LICENSE' => 'perl',
   'NAME' => 'AnyEvent::MQTT',
@@ -35,8 +35,6 @@ my %WriteMakefileArgs = (
     'AnyEvent::Handle' => '0',
     'Carp' => '0',
     'Getopt::Long' => '0',
-    'Gtk2' => '0',
-    'Gtk2::SimpleList' => '0',
     'Net::MQTT::Constants' => '0',
     'Net::MQTT::Message' => '0',
     'POSIX' => '0',
@@ -45,7 +43,7 @@ my %WriteMakefileArgs = (
     'Sub::Name' => '0',
     'constant' => '0'
   },
-  'VERSION' => '1.110880',
+  'VERSION' => '1.111980',
   'test' => {
     'TESTS' => 't/*.t'
   }

@@ -2,7 +2,7 @@ use strict;
 use warnings;
 package AnyEvent::MQTT;
 BEGIN {
-  $AnyEvent::MQTT::VERSION = '1.110880';
+  $AnyEvent::MQTT::VERSION = '1.111980';
 }
 
 # ABSTRACT: AnyEvent module for an MQTT client
@@ -52,7 +52,13 @@ sub DESTROY {
 sub cleanup {
   my $self = shift;
   print STDERR "cleanup\n" if DEBUG;
-  $self->{handle}->destroy if ($self->{handle});
+  if ($self->{handle}) {
+    my $cv = AnyEvent->condvar;
+    my $handle = $self->{handle};
+    weaken $handle;
+    $cv->cb(sub { $handle->destroy });
+    $self->_send(message_type => MQTT_DISCONNECT, cv => $cv);
+  }
   delete $self->{handle};
   delete $self->{connected};
   delete $self->{wait};
@@ -84,10 +90,7 @@ sub publish {
     print STDERR "publish: message[$message] => $topic\n" if DEBUG;
     $self->_send_with_ack({
                            message_type => MQTT_PUBLISH,
-                           qos => $qos,
-                           retain => $p{retain},
-                           topic => $topic,
-                           message => $message,
+                           %p,
                           }, $cv, $expect);
     return $cv;
   }
@@ -151,8 +154,7 @@ sub _send_with_ack {
                           print ref $self, " timeout waiting for ",
                             message_type_string($expect), "\n" if DEBUG;
                           delete $self->{inflight}->{$mid};
-                          $self->_send_with_ack($args, $cv,
-                                                $expect, 1);
+                          $self->_send_with_ack($args, $cv, $expect, 1);
                         }),
                      };
                    });
@@ -603,7 +605,7 @@ AnyEvent::MQTT - AnyEvent module for an MQTT client
 
 =head1 VERSION
 
-version 1.110880
+version 1.111980
 
 =head1 SYNOPSIS
 
@@ -617,7 +619,7 @@ version 1.110880
   my $qos = $cv->recv; # subscribed, negotiated QoS == $qos
 
   # publish a simple message
-  my $cv = $mqtt->publish(message => 'simple message',
+  $cv = $mqtt->publish(message => 'simple message',
                           topic => '/topic');
   $cv->recv; # sent
 
@@ -627,7 +629,7 @@ version 1.110880
   $cv->recv; # sent
 
   # publish from AnyEvent::Handle
-  $cv = $mqtt->publish(handle => AnyEvent::Handle->new(...),
+  $cv = $mqtt->publish(handle => AnyEvent::Handle->new(my %handle_args),
                        topic => '/topic');
   $cv->recv; # sent
 
@@ -704,9 +706,10 @@ disconnection or fatal error.
 =head2 C<publish( %parameters )>
 
 This method is used to publish to a given topic.  It returns an
-L<AnyEvent::condvar> which is notified when the publish is complete
-(written to the kernel or ack'd depending on the QoS level).  The
-parameter hash must included at least a B<topic> value and one of:
+L<AnyEvent condvar|AnyEvent/"CONDITION VARIABLES"> which is notified
+when the publish is complete (written to the kernel or ack'd depending
+on the QoS level).  The parameter hash must included at least a
+B<topic> value and one of:
 
 =over
 
